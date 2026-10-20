@@ -1,0 +1,389 @@
+"""
+FastAPI Application for SIH26017.
+Predictive Analytics System for Early Detection of Land Acquisition Delays.
+"""
+
+import os
+from fastapi import FastAPI, HTTPException, Query, Depends, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from typing import Optional, List, Dict, Any
+
+from src.api.schemas import (
+    ProjectListResponse,
+    ProjectDetail,
+    RiskProfileResponse,
+    ExplanationResponse,
+    RisksSummaryResponse,
+    GeoProjectItem,
+    LoginRequest,
+    TokenResponse,
+    UserProfile,
+    InterventionCreate,
+    InterventionResponse,
+    AuditLogItem,
+    AuditLogListResponse,
+    SimulationRequest,
+    CustomProjectSimulationRequest,
+    SimulationResponse,
+    StatutoryAssessmentResponse,
+    NoticeDraftRequest,
+    NoticeDraftResponse,
+    SurvivalResponse,
+    CorridorAnalysisRequest,
+    CorridorAnalysisResponse,
+    GraphNetworkResponse,
+    CascadeRequest,
+    CascadeResponse
+)
+from src.api.auth import (
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    require_admin,
+    User
+)
+from src.api.service import get_service
+from src.regulatory.rfctlarr import RFCTLARRStatutoryEngine
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+FRONTEND_DIST = os.path.join(BASE_DIR, "frontend", "dist")
+
+app = FastAPI(
+    title="SIH26017: Land Acquisition Delay Predictive Analytics API",
+    description="Ministry of Rural Development — Predictive Analytics System for Early Detection of Land Acquisition Delays.",
+    version="1.0.0"
+)
+
+# Enable CORS for Vite frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def read_root(request: Request):
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and os.path.exists(FRONTEND_DIST):
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+    return {
+        "system": "SIH26017: Land Acquisition Delay Early Detection System",
+        "authority": "Ministry of Rural Development, Government of India",
+        "status": "Operational",
+        "version": "1.0.0",
+        "app_url": "/app",
+        "docs_url": "/docs"
+    }
+
+
+# 1. Projects Catalog (Both /projects and /api/projects)
+@app.get("/projects", response_model=ProjectListResponse)
+@app.get("/api/projects", response_model=ProjectListResponse)
+def list_projects(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=200, description="Items per page"),
+    sector: Optional[str] = Query(None, description="Filter by sector"),
+    state: Optional[str] = Query(None, description="Filter by state"),
+    risk_category: Optional[str] = Query(None, description="Filter by risk tier (LOW/MEDIUM/HIGH/CRITICAL)"),
+    search: Optional[str] = Query(None, description="Search term for code or title")
+):
+    service = get_service()
+    return service.get_projects(
+        page=page,
+        page_size=page_size,
+        sector=sector,
+        state=state,
+        risk_category=risk_category,
+        search=search
+    )
+
+# 2. Executive Risks Summary & Priority Queue
+@app.get("/risks", response_model=RisksSummaryResponse)
+@app.get("/api/risks", response_model=RisksSummaryResponse)
+def get_risks_summary():
+    service = get_service()
+    return service.get_risks_summary()
+
+# 3. GIS Map Coordinates
+@app.get("/geo/projects", response_model=List[GeoProjectItem])
+@app.get("/api/geo/projects", response_model=List[GeoProjectItem])
+def get_geo_projects():
+    service = get_service()
+    return service.get_geo_projects()
+
+# 4. Project Detail Sheet
+@app.get("/projects/{project_code}", response_model=ProjectDetail)
+@app.get("/api/projects/{project_code}", response_model=ProjectDetail)
+def get_project_detail(project_code: str):
+    service = get_service()
+    detail = service.get_project_by_id(project_code)
+    if detail is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Project '{project_code}' not found in authentic repository."
+        )
+    return detail
+
+# 5. Project Risk Profile
+@app.get("/projects/{project_code}/risk", response_model=RiskProfileResponse)
+@app.get("/api/projects/{project_code}/risk", response_model=RiskProfileResponse)
+def get_project_risk(project_code: str):
+    service = get_service()
+    risk = service.get_project_risk(project_code)
+    if risk is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Prediction unavailable — insufficient validated data"
+        )
+    return risk
+
+# 6. Project SHAP Explainability & Plain-Language Decision Support
+@app.get("/projects/{project_code}/explanation", response_model=ExplanationResponse)
+@app.get("/api/projects/{project_code}/explanation", response_model=ExplanationResponse)
+def get_project_explanation(project_code: str):
+    service = get_service()
+    expl = service.get_project_explanation(project_code, top_k=4)
+    if expl is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Explanation unavailable — project not found."
+        )
+    return expl
+
+# ----------------- Phase 5: Authentication & Session Routes -----------------
+
+@app.post("/auth/login", response_model=TokenResponse)
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(creds: LoginRequest):
+    user = authenticate_user(creds.username, creds.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials. For demo: use admin/sih26017 or viewer/viewer123.",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    token = create_access_token(user)
+    service = get_service()
+    service.record_audit_log(
+        username=user.username,
+        role=user.role,
+        action="USER_LOGIN",
+        project_code=None,
+        details=f"User {user.name} ({user.role}) authenticated successfully."
+    )
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "username": user.username,
+            "name": user.name,
+            "role": user.role,
+            "department": user.department
+        }
+    }
+
+@app.get("/auth/me", response_model=UserProfile)
+@app.get("/api/auth/me", response_model=UserProfile)
+def get_me(current_user: User = Depends(get_current_user)):
+    return {
+        "username": current_user.username,
+        "name": current_user.name,
+        "role": current_user.role,
+        "department": current_user.department
+    }
+
+# ----------------- Phase 5: Administrative Interventions & Audit Trail -----------------
+
+@app.post("/interventions", response_model=InterventionResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/api/interventions", response_model=InterventionResponse, status_code=status.HTTP_201_CREATED)
+def create_intervention(
+    body: InterventionCreate,
+    current_user: User = Depends(require_admin)
+):
+    """
+    Records an official administrative intervention on a project.
+    Restricted to authenticated Admin users (MoRD Officers).
+    """
+    service = get_service()
+    try:
+        record = service.record_intervention(
+            project_code=body.project_code,
+            username=current_user.username,
+            role=current_user.role,
+            intervention_type=body.intervention_type,
+            notes=body.notes
+        )
+        return record
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.get("/interventions", response_model=List[InterventionResponse])
+@app.get("/api/interventions", response_model=List[InterventionResponse])
+def list_interventions(project_code: Optional[str] = Query(None, description="Optional project filter")):
+    service = get_service()
+    return service.get_interventions(project_code=project_code)
+
+@app.get("/projects/{project_code}/interventions", response_model=List[InterventionResponse])
+@app.get("/api/projects/{project_code}/interventions", response_model=List[InterventionResponse])
+def get_project_interventions(project_code: str):
+    service = get_service()
+    return service.get_interventions(project_code=project_code)
+
+@app.get("/audit-logs", response_model=AuditLogListResponse)
+@app.get("/api/audit-logs", response_model=AuditLogListResponse)
+def get_audit_trail(
+    limit: int = Query(50, ge=1, le=200),
+    project_code: Optional[str] = Query(None),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Returns immutable chronological audit logs for compliance tracking.
+    Restricted to authenticated Admin users.
+    """
+    service = get_service()
+    items = service.get_audit_logs(limit=limit, project_code=project_code)
+    return {
+        "total": len(items),
+        "items": items
+    }
+
+
+# ----------------- Phase 6: Simulation & Statutory Routes -----------------
+
+@app.post("/projects/{project_code}/simulate")
+@app.post("/api/projects/{project_code}/simulate")
+def simulate_project_route(project_code: str, body: SimulationRequest):
+    service = get_service()
+    res = service.simulate_project(
+        project_code=project_code,
+        package_split_count=body.package_split_count,
+        contingency_budget_pct=body.contingency_budget_pct,
+        dedicated_slao_taskforce=body.dedicated_slao_taskforce,
+        parallel_statutory_hearings=body.parallel_statutory_hearings,
+        row_pre_possession_pct=body.row_pre_possession_pct,
+        execution_buffer_months=body.execution_buffer_months
+    )
+    if res is None:
+        raise HTTPException(status_code=404, detail=f"Project '{project_code}' not found.")
+    p = service.project_lookup.get(project_code, {})
+    res["project_code"] = project_code
+    res["project_name"] = str(p.get("project_name", project_code))
+    return res
+
+@app.post("/simulation/custom")
+@app.post("/api/simulation/custom")
+def simulate_custom_project_route(body: CustomProjectSimulationRequest):
+    service = get_service()
+    return service.simulate_custom_project(
+        sector=body.sector,
+        state=body.state,
+        agency=body.agency,
+        orig_cost_cr=body.orig_cost_cr,
+        planned_duration_months=body.planned_duration_months,
+        approval_year=body.approval_year,
+        levers=body.simulation_levers.model_dump()
+    )
+
+@app.get("/projects/{project_code}/statutory")
+@app.get("/api/projects/{project_code}/statutory")
+def get_project_statutory_route(project_code: str):
+    service = get_service()
+    res = service.get_statutory_assessment(project_code)
+    if res is None:
+        raise HTTPException(status_code=404, detail=f"Project '{project_code}' not found.")
+    return res
+
+@app.post("/projects/{project_code}/statutory/notice")
+@app.post("/api/projects/{project_code}/statutory/notice")
+def draft_statutory_notice_route(project_code: str, body: Dict[str, Any]):
+    service = get_service()
+    p = service.project_lookup.get(project_code)
+    if p is None:
+        raise HTTPException(status_code=404, detail=f"Project '{project_code}' not found.")
+    
+    recipient_title = body.get("recipient_title") or body.get("issuing_authority") or "District Collector & District Magistrate"
+    custom_notes = body.get("custom_instructions") or body.get("custom_notes") or body.get("notes") or ""
+    
+    return RFCTLARRStatutoryEngine.generate_executive_memorandum(
+        project_data=dict(p),
+        recipient_title=recipient_title,
+        custom_notes=custom_notes
+    )
+
+# ----------------- Phase 7: Survival Analysis Routes -----------------
+
+@app.get("/projects/{project_code}/survival", response_model=SurvivalResponse)
+@app.get("/api/projects/{project_code}/survival", response_model=SurvivalResponse)
+def get_project_survival_route(project_code: str):
+    service = get_service()
+    res = service.get_project_survival(project_code)
+    if res is None:
+        raise HTTPException(status_code=404, detail=f"Project '{project_code}' not found.")
+    return res
+
+# ----------------- Phase 8: Geospatial Corridor Routes -----------------
+
+@app.get("/geo/corridors/sample")
+@app.get("/api/geo/corridors/sample")
+def get_sample_corridors_route():
+    service = get_service()
+    return service.get_sample_corridors()
+
+@app.post("/geo/corridors/analyze", response_model=CorridorAnalysisResponse)
+@app.post("/api/geo/corridors/analyze", response_model=CorridorAnalysisResponse)
+def analyze_corridor_route(body: CorridorAnalysisRequest):
+    service = get_service()
+    return service.analyze_corridor(
+        coordinates=body.coordinates,
+        sector=body.sector,
+        state=body.state,
+        name=body.name
+    )
+
+# ----------------- Phase 9: Infrastructure Contagion Routes -----------------
+
+@app.get("/graph/network", response_model=GraphNetworkResponse)
+@app.get("/api/graph/network", response_model=GraphNetworkResponse)
+def get_graph_network_route():
+    service = get_service()
+    return service.get_contagion_network()
+
+@app.post("/graph/cascade", response_model=CascadeResponse)
+@app.post("/api/graph/cascade", response_model=CascadeResponse)
+def simulate_cascade_route(body: CascadeRequest):
+    service = get_service()
+    return service.simulate_cascade(
+        epicenter_project_code=body.epicenter_project_code,
+        delay_shock_months=body.delay_shock_months
+    )
+
+
+# Mount built React frontend if available
+if os.path.exists(FRONTEND_DIST):
+    # Serve assets
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+
+    # Serve static favicon / icons
+    @app.get("/favicon.svg")
+    def serve_favicon():
+        return FileResponse(os.path.join(FRONTEND_DIST, "favicon.svg"))
+
+    @app.get("/icons.svg")
+    def serve_icons():
+        return FileResponse(os.path.join(FRONTEND_DIST, "icons.svg"))
+
+    # Serve index.html for root and SPA routes
+    @app.get("/app")
+    @app.get("/app/{path:path}")
+    def serve_frontend_app(path: str = ""):
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("src.api.app:app", host="127.0.0.1", port=8000, reload=True)
+
+
